@@ -1,4 +1,6 @@
 defmodule Phoenix.Integration.WebsocketClient do
+  use GenServer
+
   alias Phoenix.Socket.Message
 
   @doc """
@@ -9,19 +11,17 @@ defmodule Phoenix.Integration.WebsocketClient do
     :crypto.start()
     :ssl.start()
 
-    :websocket_client.start_link(
-      String.to_charlist(url),
-      __MODULE__,
-      [sender, serializer],
-      extra_headers: headers
-    )
+    GenServer.start_link(__MODULE__, {sender, url, serializer, headers}, debug: [:trace])
   end
 
   @doc """
   Closes the socket
   """
-  def close(socket) do
-    send(socket, :close)
+  def close({conn, ref, sock} = _client) do
+    {:ok, sock, data} = Mint.WebSocket.encode(sock, :close)
+    {:ok, conn} = Mint.WebSocket.stream_request_body(conn, ref, data)
+    {:ok, conn} = Mint.HTTP.close(conn)
+    {conn, ref, sock}
   end
 
   @doc """
@@ -34,8 +34,12 @@ defmodule Phoenix.Integration.WebsocketClient do
   @doc """
   Sends a low-level text message to the client.
   """
-  def send_message(server_pid, msg) do
-    send(server_pid, {:send, msg})
+  def send_message(client, msg) do
+    # send(server_pid, {:send, msg})
+    {conn, ref, _sock} = client
+    {:ok, sock, data} = encode(client, {:text, msg})
+    {:ok, conn} = Mint.WebSocket.stream_request_body(conn, ref, data)
+    {:ok, conn, sock}
   end
 
   @doc """
@@ -67,64 +71,147 @@ defmodule Phoenix.Integration.WebsocketClient do
   end
 
   @doc false
-  def init([sender, serializer], _conn_state) do
-    # Use different initial join_ref from ref to
-    # make sure the server is not coupling them.
-    {:ok, %{sender: sender, topics: %{}, join_ref: 11, ref: 1, serializer: serializer}}
+  def init({sender, url, serializer, extra_headers}) do
+    {:ok, client} = connect(url, extra_headers)
+
+    ## Use different initial join_ref from ref to
+    ## make sure the server is not coupling them.
+    {:ok,
+     %{
+       sender: sender,
+       serializer: serializer,
+       client: client,
+       topics: %{},
+       join_ref: 11,
+       ref: 1
+     }}
   end
 
-  @doc false
-  def websocket_handle({:text, msg}, _conn_state, %{serializer: :noop} = state) do
-    send(state.sender, {:text, msg})
-    {:ok, state}
-  end
+  def connect(url, extra_headers \\ []) when is_binary(url) do
+    {:ok, uri} = uri_new(url)
 
-  def websocket_handle({:text, msg}, _conn_state, state) do
-    send(state.sender, state.serializer.decode!(msg, opcode: :text))
-    {:ok, state}
-  end
+    http_scheme =
+      case String.to_existing_atom(uri.scheme) do
+        :ws -> :http
+        :wss -> :https
+        other -> other
+      end
 
-  def websocket_handle({:binary, data}, _conn_state, state) do
-    send(state.sender, binary_decode(data))
-    {:ok, state}
-  end
+    ws_scheme =
+      case http_scheme do
+        :http -> :ws
+        :https -> :wss
+      end
 
-  # The websocket client always sends a payload, even when none is explicitly set
-  # on the frame.
-  def websocket_handle({opcode, msg}, _conn_state, state) when opcode in [:ping, :pong] do
-    send(state.sender, {:control, opcode, msg})
-    {:ok, state}
-  end
+    {:ok, conn} = Mint.HTTP.connect(http_scheme, uri.host, uri.port)
+    {:ok, conn, ref} = Mint.WebSocket.upgrade(ws_scheme, conn, uri.path, extra_headers)
 
-  @doc false
-  def websocket_info({:send, msg}, _conn_state, %{serializer: :noop} = state) do
-    {:reply, {:text, msg}, state}
-  end
+    receive do
+      reply ->
+        {:ok, conn, resp} = Mint.WebSocket.stream(conn, reply)
 
-  def websocket_info({:control, opcode, msg}, _conn_state, %{serializer: :noop} = state) do
-    case msg do
-      :none -> {:reply, opcode, state}
-      _ -> {:reply, {opcode, msg}, state}
+        upgraded =
+          Enum.reduce(resp, %{}, fn
+            {:status, ^ref, code}, res -> Map.put(res, :status, code)
+            {:headers, ^ref, headers}, res -> Map.put(res, :headers, headers)
+            _other, res -> res
+          end)
+
+        {:ok, conn, sock} = Mint.WebSocket.new(conn, ref, upgraded[:status], upgraded[:headers])
+        {:ok, {conn, ref, sock}}
     end
   end
 
-  def websocket_info({:send, %Message{payload: {:binary, _}} = msg}, _conn_state, %{ref: ref} = state) do
+  def decode({_conn, _ref, sock} = _client, data) do
+    Mint.WebSocket.decode(sock, data)
+  end
+
+  def encode({_conn, _ref, sock} = _client, data) do
+    Mint.WebSocket.encode(sock, data)
+  end
+
+  def uri_new(url) do
+    # URI.new for elixir < 1.13.0.
+    case :uri_string.parse(url) do
+      %{} = map ->
+        {:ok, Map.merge(%URI{}, map)}
+
+      {:error, :invalid_uri, term} ->
+        {:error, Kernel.to_string(term)}
+    end
+  end
+
+  def handle_info({:send, msg}, %{serializer: :noop} = state) do
+    send(state.sender, {:text, msg})
+    {:noreply, state}
+  end
+
+  def handle_info({:text, msg}, %{serializer: :noop} = state) do
+    send(state.sender, {:text, msg})
+    {:noreply, state}
+  end
+
+  def handle_info({:text, msg}, state) do
+    send(state.sender, state.serializer.decode!(msg, opcode: :text))
+    {:noreply, state}
+  end
+
+  def handle_info({:binary, data}, state) do
+    send(state.sender, binary_decode(data))
+    {:noreply, state}
+  end
+
+  def handle_info({:control, opcode, msg}, state) when opcode in [:ping, :pong] do
+    send(state.sender, {:control, opcode, msg})
+    {:noreply, state}
+  end
+
+  def handle_info({:control, opcode, msg}, %{serializer: :noop} = state) do
+    case msg do
+      :none ->
+        send(state.sender, opcode)
+        {:noreply, state}
+
+      _ ->
+        send(state.sender, {opcode, msg})
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:send, %Message{payload: {:binary, _}} = msg},
+        %{ref: ref} = state
+      ) do
     {join_ref, state} = join_ref_for(msg, state)
     msg = Map.merge(msg, %{ref: to_string(ref), join_ref: to_string(join_ref)})
     {:reply, {:binary, binary_encode_push!(msg)}, put_in(state.ref, ref + 1)}
   end
 
-  def websocket_info({:send, %Message{} = msg}, _conn_state, %{ref: ref} = state) do
+  def handle_info({:tcp, _, _} = msg, state) do
+    {:ok, conn, responses} = Mint.WebSocket.stream(state.conn, msg)
+    # WIP
+    {:noreply, state}
+  end
+
+  def handle_info({:send, %Message{} = msg}, %{ref: ref} = state) do
     {join_ref, state} = join_ref_for(msg, state)
     msg = Map.merge(msg, %{ref: to_string(ref), join_ref: to_string(join_ref)})
     {:reply, {:text, encode!(msg, state)}, put_in(state.ref, ref + 1)}
   end
 
-  def websocket_info(:close, _conn_state, _state) do
+  def handle_info(:close, state) do
     {:close, <<>>, "done"}
+    {:stop, :close, state}
   end
 
-  defp join_ref_for(%{topic: topic, event: "phx_join"}, %{topics: topics, join_ref: join_ref} = state) do
+  def handle_info(msg, state) do
+    {:noreply, state}
+  end
+
+  defp join_ref_for(
+         %{topic: topic, event: "phx_join"},
+         %{topics: topics, join_ref: join_ref} = state
+       ) do
     topics = Map.put(topics, topic, join_ref)
     {join_ref, %{state | topics: topics, join_ref: join_ref + 1}}
   end
